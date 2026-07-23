@@ -57,6 +57,7 @@ export default function PosPage() {
   const [promoDiscount, setPromoDiscount] = useState<PromoDiscount | null>(null);
   const [promoError, setPromoError] = useState<string | null>(null);
   const [applyingPromo, setApplyingPromo] = useState(false);
+  const [autoBulkDiscount, setAutoBulkDiscount] = useState<PromoDiscount | null>(null);
 
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("cash");
 
@@ -122,11 +123,62 @@ export default function PosPage() {
   );
   const cartQty = cartWithDetails.reduce((sum, item) => sum + item.qty, 0);
 
+  // Automatic bulk discount — same rule as the customer site. Only
+  // checked when staff hasn't overridden with a manual discount or
+  // already applied a promo code (those take priority).
+  useEffect(() => {
+    if (manualDiscountInput.trim() || promoDiscount || cartQty === 0) {
+      setAutoBulkDiscount(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    async function checkBulkDiscount() {
+      const res = await fetch("/api/admin/pos/validate-promo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: "", subtotal, cartQty }),
+      });
+
+      if (res.status === 401) {
+        router.push("/admin/login");
+        return;
+      }
+
+      const json = await res.json();
+      if (cancelled) return;
+
+      if (res.ok && json.discountId) {
+        setAutoBulkDiscount({ id: json.discountId, amount: json.discountAmount, label: json.label });
+      } else {
+        setAutoBulkDiscount(null);
+      }
+    }
+
+    checkBulkDiscount();
+    return () => {
+      cancelled = true;
+    };
+  }, [cartQty, subtotal, manualDiscountInput, promoDiscount, router]);
+
   const manualDiscountAmount = manualDiscountInput.trim()
     ? parseManualDiscount(manualDiscountInput, subtotal)
     : 0;
-  const discountAmount = promoDiscount ? promoDiscount.amount : manualDiscountAmount;
-  const discountId = promoDiscount ? promoDiscount.id : null;
+  const discountAmount = manualDiscountInput.trim()
+    ? manualDiscountAmount
+    : promoDiscount
+    ? promoDiscount.amount
+    : autoBulkDiscount
+    ? autoBulkDiscount.amount
+    : 0;
+  const discountId = manualDiscountInput.trim()
+    ? null
+    : promoDiscount
+    ? promoDiscount.id
+    : autoBulkDiscount
+    ? autoBulkDiscount.id
+    : null;
   const total = Math.max(0, subtotal - discountAmount);
 
   function addToCart(productId: string) {
@@ -215,6 +267,7 @@ export default function PosPage() {
     setPromoCodeInput("");
     setPromoDiscount(null);
     setPromoError(null);
+    setAutoBulkDiscount(null);
     setPaymentMethod("cash");
   }
 
@@ -422,6 +475,11 @@ export default function PosPage() {
                 )}
                 {promoError && (
                   <p className="mt-1 text-xs text-red-600">{promoError}</p>
+                )}
+                {!promoDiscount && !manualDiscountInput.trim() && autoBulkDiscount && (
+                  <p className="mt-1 text-xs text-green-700 dark:text-green-400">
+                    {autoBulkDiscount.label}
+                  </p>
                 )}
               </div>
 

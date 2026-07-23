@@ -52,6 +52,41 @@ Left as-is for now at the user's request (2026-07-17).
    `partial_return` status is excluded from overdue — customer has engaged,
    outstanding boxes tracked separately.
 
+## Financial report design decisions
+- Cost source: `products.cost_price` if set and > 0, otherwise
+  auto-calculated from `recipe_items` × `ingredient.cost_per_unit`.
+  Each row shows which source was used.
+- Fulfilled orders = `status IN ('delivered', 'completed')` only.
+- Period filter uses `created_at` for consistency with the sales report.
+- Sections 2 (outstanding payments) and 3 (deposit ledger) are
+  current-state snapshots — intentionally not period-scoped.
+  Do not change this behaviour.
+
+## Reporting layer — known data gaps (V2 backlog)
+1. **No stock movement audit trail.** `product_stock` and `ingredient_stock`
+   are overwritten in place by production, POS sales, and online-order
+   fulfilment — only *manual* adjustments are logged (via
+   `product_stock_adjustments` / `ingredient_stock_adjustments`).
+   Fix: a `stock_movements` table, append-only.
+2. **No ingredient deduction audit trail.** `deduct_ingredients()` writes
+   straight to `ingredient_stock.qty_on_hand` with no per-ingredient
+   record of what it deducted or why. Fix: an `ingredient_movements`
+   table, one row per deduction with a `production_log_id` FK.
+3. **`products.cost_price` defaults to 0 and nothing in the app ever
+   writes to it** — cost always falls back to the recipe calculation
+   (see `lib/productCost.ts`). Fix: auto-populate `cost_price` from the
+   recipe on product save, or add a scheduled recalculation job.
+4. ~~Shared cost-source fallback logic duplicated between the financial
+   report and the wastage calculation.~~ **Done** — extracted to
+   `lib/productCost.ts` (`buildProductCostMap()`), used by both
+   `/admin/reports/financial` and `/admin/reports/inventory`.
+
+Until 1–3 are addressed, historical reports for date ranges not ending
+today should be treated as **estimates, not exact figures** — e.g. the
+stock movement report (`/admin/reports/inventory`) derives "opening"
+algebraically (`opening = closing − produced + sold + wasted`), where
+"closing" is always *current* `qty_on_hand`, not a dated snapshot.
+
 ## Build status
 
 ### Phase 1 — complete
@@ -68,7 +103,7 @@ Pages built:
 - `/admin` — stock and reservation overview
 - `/admin/settings/deposit-tiers` — deposit tier editor
 - `/admin/payments` — payment verification (Pending / Recently Approved tabs; approve, reject, request new receipt)
-- `/admin/login` — admin password login
+- `/admin/login` — admin login (Supabase Auth email/password — see "Admin auth" below; this replaced an original single shared password gate)
 
 Integrations:
 - Resend sends the booking confirmation email on payment approval (`RESEND_API_KEY`, `EMAIL_FROM` in `.env.local`) — see `lib/sendBookingConfirmation.ts`
@@ -97,12 +132,55 @@ Key behaviors from Phase 3:
 - **`deduct_ingredients()` only runs from `mark_production_produced()`** — the "Mark as Produced" action on `/admin/production`. Nothing else calls it; ingredient stock never moves except through that one path (plus manual adjustments on `/admin/inventory/ingredients`).
 - **Foam box deposits are manual, no auto-refund.** `refund_foam_box_deposit()` always requires a staff-entered amount via the "Refund Deposit" action — nothing in the system ever refunds a deposit automatically, including on return or loss (a lost rental's deposit is explicitly forfeited and left untouched — see the Foam box tracker section above).
 
-### Phase 4 — next
-Reporting, discounts engine, proper auth, final testing and go-live.
+### Phase 4 — in progress
+Reporting (complete), discounts engine (complete), proper auth (complete —
+see "Admin auth" below), final testing and go-live (remaining).
 
 ## Admin auth
-Note in CLAUDE.md: /admin/* is currently protected by a single
-shared password gate (ADMIN_PASSWORD env var, checked server-side).
-This is temporary. Phase 4 will replace this with proper auth:
-Supabase Auth with role-based access (admin / staff), separate login
-per user, and an audit log on the payment_receipts table.
+Per-user Supabase Auth with role-based access, replacing the original
+single shared `ADMIN_PASSWORD` cookie gate (migration 024).
+
+- `staff_users` maps a Supabase Auth user (`auth.users.id`) to a role
+  (`admin` | `staff`) and an `is_active` flag. Deactivating here does
+  **not** delete the underlying Auth account — it's fully reversible,
+  and `proxy.ts` checks `is_active` on every request (not just at
+  login), so deactivating mid-session blocks the very next request.
+- `proxy.ts` (not `middleware.ts` — see the note at the top of that
+  file) checks the Supabase session via `@supabase/ssr` on every
+  `/admin/*` and `/api/admin/*` request, using `auth.getUser()` (not
+  `getSession()`) so the JWT is revalidated against the Auth server
+  rather than trusted from a decoded cookie.
+- **Staff role is a strict allowlist**, not a blocklist: staff may
+  only reach `/admin/pos`, `/admin/production`, `/admin/calendar`,
+  `/admin/inventory` (pages and their `/api/admin/*` equivalents),
+  plus the shared low-stock alerts endpoint. Everything else under
+  `/admin/*` — including the dashboard root `/admin` itself — redirects
+  staff to `/admin/pos?denied=1`. Any new admin page is staff-blocked
+  by default unless explicitly added to `STAFF_ALLOWED_PREFIXES` /
+  `STAFF_ALLOWED_API_PREFIXES` in `proxy.ts`.
+- `lib/supabaseBrowser.ts` (cookie-backed session, admin-side only) vs
+  `lib/supabase.ts` (unchanged, localStorage-backed, customer site
+  only) vs `lib/supabaseServer.ts` (Route Handlers / Server Components
+  needing the current user) vs `lib/supabaseAdmin.ts` (service-role,
+  bypasses RLS entirely) — four different Supabase clients for four
+  different trust levels; don't mix them up.
+- `/admin/settings/staff` (admin-only) creates staff via the Auth
+  Admin API (`supabaseAdmin.auth.admin.createUser()`, `email_confirm: true`)
+  then inserts the matching `staff_users` row — these are two separate
+  systems (GoTrue + Postgres) that can't share one transaction, so a
+  failed `staff_users` insert triggers a best-effort compensating
+  `deleteUser()` on the just-created Auth account.
+
+**Manual dashboard steps this depended on** (can't be done from code):
+1. Supabase dashboard → Authentication → Providers → Email must be
+   enabled.
+2. Supabase dashboard → Authentication → Sessions — the spec asked
+   for 8-hour sessions; the closest equivalent is the dashboard's
+   session time-box setting (if available on your plan) or JWT expiry
+   under Authentication → Settings. Neither is configurable from a
+   migration or app code.
+3. The very first admin account: create the Auth user (Authentication
+   → Users → Add user) and a matching `staff_users` row with
+   `role = 'admin'` — `/admin/settings/staff` can create every
+   subsequent staff member, but it's admin-only, so the first admin
+   has to exist before anyone can use it.

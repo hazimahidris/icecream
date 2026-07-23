@@ -2,29 +2,55 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { supabaseBrowser } from "@/lib/supabaseBrowser";
 
 export default function AdminLoginPage() {
   const router = useRouter();
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  const [resetSent, setResetSent] = useState(false);
+  const [resetSending, setResetSending] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
 
   async function handleLogin() {
     setError(null);
     setLoading(true);
 
-    const res = await fetch("/api/admin/auth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password }),
+    const { error: signInError } = await supabaseBrowser.auth.signInWithPassword({
+      email: email.trim(),
+      password,
     });
 
-    if (res.ok) {
-      router.push("/admin");
-    } else {
-      setError("Incorrect password");
+    if (signInError) {
+      setError("Incorrect email or password");
       setLoading(false);
+      return;
     }
+
+    router.push("/admin");
+    router.refresh();
+  }
+
+  async function handleForgotPassword() {
+    setResetError(null);
+    setResetSent(false);
+
+    if (!email.trim()) {
+      setResetError("Enter your email above first.");
+      return;
+    }
+
+    setResetSending(true);
+    // Errors aren't surfaced with specifics — a generic confirmation
+    // either way avoids revealing whether an email is registered.
+    await supabaseBrowser.auth.resetPasswordForEmail(email.trim(), {
+      redirectTo: `${window.location.origin}/admin/reset-password`,
+    });
+    setResetSending(false);
+    setResetSent(true);
   }
 
   return (
@@ -39,6 +65,21 @@ export default function AdminLoginPage() {
         className="mt-6 space-y-4"
       >
         <div>
+          <label className="text-sm font-medium" htmlFor="admin-email">
+            Email
+          </label>
+          <input
+            id="admin-email"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            autoFocus
+            autoComplete="email"
+            className="mt-1 block w-full rounded border border-gray-300 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-900"
+          />
+        </div>
+
+        <div>
           <label className="text-sm font-medium" htmlFor="admin-password">
             Password
           </label>
@@ -47,7 +88,7 @@ export default function AdminLoginPage() {
             type="password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            autoFocus
+            autoComplete="current-password"
             className="mt-1 block w-full rounded border border-gray-300 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-900"
           />
         </div>
@@ -66,6 +107,23 @@ export default function AdminLoginPage() {
           {loading ? "Signing in..." : "Sign in"}
         </button>
       </form>
+
+      <div className="mt-4 text-center">
+        <button
+          type="button"
+          onClick={handleForgotPassword}
+          disabled={resetSending}
+          className="text-sm text-gray-500 underline disabled:opacity-40"
+        >
+          {resetSending ? "Sending..." : "Forgot password?"}
+        </button>
+        {resetSent && (
+          <p className="mt-2 text-xs text-gray-500">
+            If that email is registered, a reset link has been sent.
+          </p>
+        )}
+        {resetError && <p className="mt-2 text-xs text-red-600">{resetError}</p>}
+      </div>
     </main>
   );
 }

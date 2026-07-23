@@ -35,6 +35,17 @@ type DepositTier = {
   deposit_value: number;
 };
 
+type ResolvedDiscount = {
+  discountId: string | null;
+  code: string | null;
+  type: string | null;
+  value: number | null;
+  minQty: number | null;
+  amount: number;
+  source: "promo" | "bulk" | null;
+  codeError: string | null;
+};
+
 type Step = 1 | 2 | 3 | 4;
 
 type Fulfilment = "pickup" | "delivery";
@@ -130,6 +141,11 @@ export default function ProductOrderPage() {
 
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+
+  const [promoInput, setPromoInput] = useState("");
+  const [appliedCode, setAppliedCode] = useState("");
+  const [resolvedDiscount, setResolvedDiscount] = useState<ResolvedDiscount | null>(null);
+  const [checkingDiscount, setCheckingDiscount] = useState(false);
 
   useEffect(() => {
     async function loadProducts() {
@@ -229,11 +245,71 @@ export default function ProductOrderPage() {
   );
 
   const total = productTotal + addonTotal;
+  const totalPcs = cartWithDetails.reduce((sum, item) => sum + item.qty, 0);
+
+  const discountAmount = resolvedDiscount?.amount ?? 0;
+  const finalTotal = Math.max(0, total - discountAmount);
 
   const timeSelected = selectedHour !== "" && selectedPeriod !== "";
   const selectedTime = timeSelected
     ? toSQLTime(selectedHour, selectedPeriod as (typeof PERIODS)[number])
     : "";
+
+  // Resolves both the automatic bulk discount and (if the customer
+  // applied one) a promo code in a single server-side call — the RPC
+  // itself decides which one wins when both are eligible, so there's
+  // no discount-comparison logic duplicated here.
+  useEffect(() => {
+    if (step !== 4 || totalPcs === 0) {
+      setResolvedDiscount(null);
+      return;
+    }
+
+    let cancelled = false;
+    setCheckingDiscount(true);
+
+    async function checkDiscount() {
+      const { data, error } = await supabase.rpc("find_applicable_discount", {
+        p_code: appliedCode || null,
+        p_cart_qty: totalPcs,
+        p_subtotal: total,
+      });
+
+      if (cancelled) return;
+      setCheckingDiscount(false);
+
+      const row = Array.isArray(data) ? data[0] : data;
+      if (error || !row) {
+        setResolvedDiscount(null);
+        return;
+      }
+
+      setResolvedDiscount({
+        discountId: row.discount_id,
+        code: row.discount_code,
+        type: row.discount_type,
+        value: row.discount_value,
+        minQty: row.discount_min_qty,
+        amount: Number(row.discount_amount),
+        source: row.source,
+        codeError: row.code_error,
+      });
+    }
+
+    checkDiscount();
+    return () => {
+      cancelled = true;
+    };
+  }, [step, totalPcs, total, appliedCode]);
+
+  function handleApplyPromo() {
+    setAppliedCode(promoInput.trim());
+  }
+
+  function handleClearPromo() {
+    setPromoInput("");
+    setAppliedCode("");
+  }
 
   function toggleFlavour(id: string) {
     setCart((prev) => {
@@ -332,16 +408,18 @@ export default function ProductOrderPage() {
     isValidPhone(customerPhone) &&
     (fulfilment !== "delivery" || deliveryAddress.trim() !== "");
 
+  // Deposit is based on the post-discount total — what the customer
+  // actually owes, not the pre-discount subtotal.
   const matchedDepositTier = depositTiers.find(
     (tier) =>
-      total >= tier.min_amount &&
-      (tier.max_amount === null || total <= tier.max_amount)
+      finalTotal >= tier.min_amount &&
+      (tier.max_amount === null || finalTotal <= tier.max_amount)
   );
   // Falls back to full payment if no tier matches (e.g. the tiers were
   // edited in /admin/settings/deposit-tiers and now leave a gap).
   const depositPercent = matchedDepositTier?.deposit_value ?? 100;
-  const amountToPayNow = total * (depositPercent / 100);
-  const balanceDue = total - amountToPayNow;
+  const amountToPayNow = finalTotal * (depositPercent / 100);
+  const balanceDue = finalTotal - amountToPayNow;
 
   async function handleConfirmOrder() {
     setSubmitting(true);
@@ -361,7 +439,7 @@ export default function ProductOrderPage() {
       p_delivery_address:
         fulfilment === "delivery" ? deliveryAddress.trim() : null,
       p_remarks: remarks.trim() || null,
-      p_total: total,
+      p_subtotal: total,
       p_deposit_required: amountToPayNow,
       p_items: cartWithDetails.map((item) => ({
         product_id: item.productId,
@@ -375,6 +453,12 @@ export default function ProductOrderPage() {
           qty: addonQty[addon.id],
           unit_price: addon.price,
         })),
+      // The server independently re-validates and recomputes the
+      // discount from this code — it never trusts a client-computed
+      // amount (place_order is reachable directly with the public
+      // anon key, so a client-submitted discount would be a way to
+      // hand yourself an arbitrary discount).
+      p_promo_code: appliedCode || null,
     });
 
     if (error || !orderId) {
@@ -976,11 +1060,86 @@ export default function ProductOrderPage() {
                 <span>Subtotal</span>
                 <span>RM {total.toFixed(2)}</span>
               </div>
+              {discountAmount > 0 && (
+                <div className="flex justify-between text-green-700 dark:text-green-400">
+                  <span>Discount</span>
+                  <span>-RM {discountAmount.toFixed(2)}</span>
+                </div>
+              )}
               <div className="flex justify-between font-medium">
                 <span>Total</span>
-                <span>RM {total.toFixed(2)}</span>
+                <span>RM {finalTotal.toFixed(2)}</span>
               </div>
             </div>
+          </div>
+
+          <div className="mt-4 rounded-lg border border-gray-200 p-4 dark:border-gray-700">
+            <label className="text-sm font-medium" htmlFor="promo-code">
+              Have a promo code?
+            </label>
+            <div className="mt-1 flex gap-2">
+              <input
+                id="promo-code"
+                type="text"
+                value={promoInput}
+                onChange={(e) => setPromoInput(e.target.value)}
+                placeholder="CODE"
+                className="block w-full rounded border border-gray-300 px-3 py-2 text-base uppercase dark:border-gray-700 dark:bg-gray-900"
+              />
+              {appliedCode ? (
+                <button
+                  type="button"
+                  onClick={handleClearPromo}
+                  className="min-h-11 shrink-0 rounded border border-gray-300 px-3 text-sm font-medium dark:border-gray-700"
+                >
+                  Clear
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleApplyPromo}
+                  disabled={checkingDiscount || !promoInput.trim()}
+                  className="min-h-11 shrink-0 rounded border border-gray-300 px-3 text-sm font-medium disabled:opacity-40 dark:border-gray-700"
+                >
+                  Apply
+                </button>
+              )}
+            </div>
+
+            {checkingDiscount && (
+              <p className="mt-2 text-xs text-gray-500">Checking...</p>
+            )}
+
+            {!checkingDiscount && appliedCode && resolvedDiscount?.codeError && (
+              <p className="mt-2 text-xs text-red-600">Code not found or expired</p>
+            )}
+
+            {!checkingDiscount &&
+              appliedCode &&
+              !resolvedDiscount?.codeError &&
+              resolvedDiscount?.source === "promo" && (
+                <p className="mt-2 text-xs text-green-700 dark:text-green-400">
+                  Promo code {resolvedDiscount.code} applied: -RM{" "}
+                  {resolvedDiscount.amount.toFixed(2)}
+                </p>
+              )}
+
+            {!checkingDiscount &&
+              appliedCode &&
+              !resolvedDiscount?.codeError &&
+              resolvedDiscount?.source === "bulk" && (
+                <p className="mt-2 text-xs text-gray-600 dark:text-gray-400">
+                  Your code is valid, but the automatic bulk discount below is larger and
+                  was applied instead.
+                </p>
+              )}
+
+            {!checkingDiscount && !appliedCode && resolvedDiscount?.source === "bulk" && (
+              <p className="mt-2 text-xs text-green-700 dark:text-green-400">
+                Bulk order discount applied: {resolvedDiscount.value}% off for orders of{" "}
+                {resolvedDiscount.minQty}+ pcs
+              </p>
+            )}
           </div>
 
           {depositTiersError && (
